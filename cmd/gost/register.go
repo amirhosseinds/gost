@@ -1,6 +1,10 @@
 package main
 
 import (
+	// Register spoofudp dialer and listener (IP-spoofed UDP tunnel)
+	_ "github.com/go-gost/gost/internal/dialer/spoofudp"
+	_ "github.com/go-gost/gost/internal/listener/spoofudp"
+
 	// Register connectors
 	_ "github.com/go-gost/x/connector/direct"
 	_ "github.com/go-gost/x/connector/forward"
