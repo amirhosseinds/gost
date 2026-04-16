@@ -34,7 +34,6 @@ func init() {
 	registry.DialerRegistry().Register("spoofudp", NewDialer)
 }
 
-// spoofDialer implements dialer.Dialer and dialer.Multiplexer.
 type spoofDialer struct {
 	sessions     map[string]*muxSession
 	sessionMutex sync.Mutex
@@ -43,7 +42,6 @@ type spoofDialer struct {
 	options      dialer.Options
 }
 
-// NewDialer creates a new spoofudp dialer.
 func NewDialer(opts ...dialer.Option) dialer.Dialer {
 	options := dialer.Options{}
 	for _, opt := range opts {
@@ -56,7 +54,6 @@ func NewDialer(opts ...dialer.Option) dialer.Dialer {
 	}
 }
 
-// Init parses metadata configuration.
 func (d *spoofDialer) Init(m md.Metadata) error {
 	return d.parseMetadata(m)
 }
@@ -74,13 +71,13 @@ func (d *spoofDialer) Dial(ctx context.Context, addr string, opts ...dialer.Dial
 
 	session, ok := d.sessions[addr]
 	if session != nil && session.IsClosed() {
+		// Explicitly close so the underlying PacketConn releases the UDP port.
+		session.Close()
 		delete(d.sessions, addr)
 		ok = false
 	}
 
 	if !ok {
-		// Choose which port to use as the spoofed source port.
-		// Default: same as the destination port so the server can respond to it.
 		port := d.md.spoofPort
 		if port == 0 {
 			port = raddr.Port
@@ -90,6 +87,19 @@ func (d *spoofDialer) Dial(ctx context.Context, addr string, opts ...dialer.Dial
 		pc, err := spoofconn.NewSpoofPacketConn(d.md.spoofIP, port, listenAddr)
 		if err != nil {
 			return nil, fmt.Errorf("spoofudp dialer: %w", err)
+		}
+
+		// ── Read-side address translation ──────────────────────────────
+		// KCP locks onto the first source address it sees and discards
+		// packets from any other address.  The server responds using its
+		// fake/spoofed IP, not its real IP.  We register a readMap entry
+		// so that ReadFrom translates "serverFakeIP:port" → "serverRealIP:port"
+		// before handing the packet to KCP.
+		if d.md.serverFakeIP != nil {
+			fakeAddrStr := fmt.Sprintf("%s:%d", d.md.serverFakeIP.String(), port)
+			realAddrStr := fmt.Sprintf("%s:%d", raddr.IP.String(), raddr.Port)
+			pc.AddReadAddrMapping(fakeAddrStr, realAddrStr)
+			d.logger.Debugf("spoofudp dialer: read mapping %s → %s", fakeAddrStr, realAddrStr)
 		}
 
 		session, err = d.initSession(ctx, raddr, pc)
@@ -118,7 +128,6 @@ func (d *spoofDialer) initSession(_ context.Context, addr net.Addr, conn *spoofc
 	if err != nil {
 		return nil, fmt.Errorf("spoofudp dialer: kcp.NewConn: %w", err)
 	}
-
 	applyKCPOptions(kcpConn, &d.md)
 
 	smuxCfg := smux.DefaultConfig()
@@ -132,23 +141,20 @@ func (d *spoofDialer) initSession(_ context.Context, addr net.Addr, conn *spoofc
 		kcpConn.Close()
 		return nil, fmt.Errorf("spoofudp dialer: smux.Client: %w", err)
 	}
-	return &muxSession{session: sess}, nil
+	return &muxSession{session: sess, conn: conn}, nil
 }
 
-// Multiplex implements dialer.Multiplexer – we share one KCP session.
+// Multiplex implements dialer.Multiplexer.
 func (d *spoofDialer) Multiplex() bool { return true }
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
-// deriveBlockCrypt derives a 32-byte AES-256 key from the passphrase using
-// PBKDF2-SHA1 (compatible with the kcp-go default salt used elsewhere in gost).
 func deriveBlockCrypt(key string) kcp.BlockCrypt {
 	pass := pbkdf2.Key([]byte(key), []byte("spoofudp-salt"), 4096, 32, sha1.New)
 	block, _ := kcp.NewAESBlockCrypt(pass)
 	return block
 }
 
-// applyKCPOptions sets recommended KCP parameters.
 func applyKCPOptions(conn *kcp.UDPSession, m *metadata) {
 	conn.SetStreamMode(true)
 	conn.SetWriteDelay(false)
@@ -160,19 +166,28 @@ func applyKCPOptions(conn *kcp.UDPSession, m *metadata) {
 
 // ─── mux session ────────────────────────────────────────────────────────────
 
+// muxSession wraps a smux session and its underlying SpoofPacketConn.
+// Closing the muxSession closes BOTH the smux session AND the UDP socket
+// so the port is released immediately for reuse.
 type muxSession struct {
 	session *smux.Session
+	conn    *spoofconn.SpoofPacketConn // closed together with the session
 }
 
 func (s *muxSession) GetConn() (net.Conn, error) {
 	return s.session.OpenStream()
 }
 
+// Close closes the smux session and the underlying SpoofPacketConn (UDP port).
 func (s *muxSession) Close() error {
-	if s.session == nil {
-		return nil
+	var err error
+	if s.session != nil {
+		err = s.session.Close()
 	}
-	return s.session.Close()
+	if s.conn != nil {
+		s.conn.Close()
+	}
+	return err
 }
 
 func (s *muxSession) IsClosed() bool {

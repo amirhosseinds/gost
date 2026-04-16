@@ -15,17 +15,15 @@ import (
 //	dialer:
 //	  type: spoofudp
 //	  metadata:
-//	    spoofSrc:  "10.0.0.1"   # fake source IP the client will use
-//	    spoofPort: 12345         # fake source port (defaults to dst port)
-//	    key:       "mysecret"    # pre-shared encryption key
-//	    # optional KCP tuning
-//	    mtu:   1350
-//	    sndwnd: 1024
-//	    rcvwnd: 1024
+//	    spoofSrc:     "10.0.0.1"      # fake source IP the client will use
+//	    serverFakeIP: "1.2.3.4"       # server's fake source IP (from spoofSrc on server)
+//	    spoofPort:    12345            # fake source port (defaults to dst port)
+//	    key:          "mysecret"       # pre-shared encryption key
 type metadata struct {
 	// Spoofing parameters
-	spoofIP   net.IP // fake source IPv4 (required)
-	spoofPort int    // fake source port  (0 → use dst port)
+	spoofIP      net.IP // client's fake source IPv4 (required)
+	serverFakeIP net.IP // server's fake source IP (for read-side translation, required)
+	spoofPort    int    // fake source port (0 → use dst port)
 
 	// Encryption
 	key string // pre-shared key for AES-256 via PBKDF2 (required)
@@ -56,6 +54,19 @@ func (d *spoofDialer) parseMetadata(m md.Metadata) error {
 	}
 	if d.md.spoofIP = ip.To4(); d.md.spoofIP == nil {
 		return fmt.Errorf("spoofudp dialer: spoofSrc must be an IPv4 address")
+	}
+
+	// ── Server's fake source IP ────────────────────────────────────
+	// The server sends responses using its own spoofed IP.  We need to
+	// know it so we can translate that back to the server's real IP before
+	// handing packets to KCP (which validates the source address).
+	svrFakeStr := mdutil.GetString(m, "serverFakeIP", "peerFakeIP", "serverFake")
+	if svrFakeStr != "" {
+		sip := net.ParseIP(svrFakeStr)
+		if sip == nil {
+			return fmt.Errorf("spoofudp dialer: invalid serverFakeIP %q", svrFakeStr)
+		}
+		d.md.serverFakeIP = sip.To4()
 	}
 
 	// ── Optional spoofed source port ───────────────────────────────
